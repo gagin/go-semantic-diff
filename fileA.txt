@@ -1,0 +1,12 @@
+This is the first paragraph.
+It talks about apples and oranges.
+
+This is the second paragraph.
+It is about programming in Go.
+Go is fun and efficient.
+
+This paragraph will be deleted.
+It's not important.
+
+This is a paragraph about cats.
+They are fluffy and curious.
