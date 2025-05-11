@@ -6,8 +6,7 @@ import (
 	"github.com/agnivade/levenshtein"
 )
 
-// const SemanticSimilarityThreshold = 0.70 // Old value
-const SemanticSimilarityThreshold = 0.55 // Adjusted to catch observed similarities
+// const SemanticSimilarityThreshold = 0.55 // No longer needed here, it's a global var in main.go
 
 // StubbedCosineSimilarity - STUBBED.
 func StubbedCosineSimilarity(vecA, vecB []float32) float32 {
@@ -46,7 +45,7 @@ func TextSimilarityNormalized(textA, textB string) float32 {
 	if len(textB) > maxLen {
 		maxLen = len(textB)
 	}
-	if maxLen == 0 { // Should be caught by above, but defensive
+	if maxLen == 0 {
 		return 1.0
 	}
 	similarity := 1.0 - (float32(dist) / float32(maxLen))
