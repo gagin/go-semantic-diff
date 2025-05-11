@@ -16,20 +16,38 @@ type ContentBlock struct {
 	LineStart      int
 	LineEnd        int
 	FileOrigin     string
+	SourceLineRefs []LineInfo
 }
 
-var spaceNormalizer = regexp.MustCompile(`\s+`)
-var paragraphSeparator = regexp.MustCompile(`\n\s*\n`) // Key: uses blank lines as separators
+type LineInfo struct {
+	OriginalText    string
+	TrimmedText     string
+	Checksum        string
+	OriginalLineNum int
+	FileOrigin      string
+	IsPartOfMega    bool
+	MegaBlockRefID  int
+}
 
-func NormalizeText(text string) string {
+var spaceNormalizerContentBlock = regexp.MustCompile(`\s+`)
+
+func NormalizeTextBlock(text string) string {
 	text = strings.ToLower(text)
-	text = spaceNormalizer.ReplaceAllString(text, " ")
+	text = spaceNormalizerContentBlock.ReplaceAllString(text, " ")
 	return strings.TrimSpace(text)
 }
 
-func CalculateChecksum(text string) string {
+func CalculateLineChecksum(lineText string) string {
+	normalizedLine := NormalizeTextBlock(lineText)
 	hasher := sha256.New()
-	hasher.Write([]byte(text))
+	hasher.Write([]byte(normalizedLine))
+	return hex.EncodeToString(hasher.Sum(nil))
+}
+
+func CalculateBlockChecksum(blockText string) string {
+	normalized := NormalizeTextBlock(blockText)
+	hasher := sha256.New()
+	hasher.Write([]byte(normalized))
 	return hex.EncodeToString(hasher.Sum(nil))
 }
 
@@ -62,58 +80,87 @@ func StubbedGetEmbedding(text string) []float32 {
 	return emb
 }
 
-// SegmentFile uses paragraph-based segmentation
-func SegmentFile(content string, fileOrigin string) []ContentBlock {
+var paragraphSeparatorForGapsContentBlock = regexp.MustCompile(`\n\s*\n`)
+
+func SegmentGapText(gapLines []LineInfo, fileOrigin string, startBlockID int) ([]ContentBlock, int) {
+	if len(gapLines) == 0 {
+		return []ContentBlock{}, startBlockID
+	}
+
+	var gapContentBuilder strings.Builder
+	for _, li := range gapLines {
+		gapContentBuilder.WriteString(li.OriginalText)
+		gapContentBuilder.WriteString("\n")
+	}
+	gapContent := strings.TrimSuffix(gapContentBuilder.String(), "\n")
+
 	var finalBlocks []ContentBlock
-	content = strings.ReplaceAll(content, "\r\n", "\n")
-	rawParagraphs := paragraphSeparator.Split(content, -1)
+	rawParagraphs := paragraphSeparatorForGapsContentBlock.Split(gapContent, -1)
+	blockIDCounter := startBlockID
 
-	blockIDCounter := 0
-	tempBlocks := []ContentBlock{}
-	currentLineNumberInOriginalFile := 1
+	// currentLineInfoIdx tracks the index in the original gapLines slice
+	// that corresponds to the start of the current rawParagraph segment.
+	currentLineInfoIdx := 0
 
-	for _, para := range rawParagraphs {
-		startLineForPara := currentLineNumberInOriginalFile
-		numInternalNewlinesInPara := strings.Count(para, "\n")
-		trimmedPara := strings.TrimSpace(para)
+	for _, paraText := range rawParagraphs {
+		// Find the actual content lines corresponding to this paraText from gapLines
+		// This loop consumes lines from gapLines until paraText is fully formed or gapLines end
+		var currentParaLines []LineInfo
+		var builtPara strings.Builder
+		//startIndexInGapLinesForThisPara := currentLineInfoIdx
 
-		if trimmedPara == "" {
-			currentLineNumberInOriginalFile += numInternalNewlinesInPara
-			if para != "" {
-				currentLineNumberInOriginalFile++
+		for currentLineInfoIdx < len(gapLines) {
+			lineInfo := gapLines[currentLineInfoIdx]
+			currentParaLines = append(currentParaLines, lineInfo)
+			builtPara.WriteString(lineInfo.OriginalText)
+
+			// Check if the builtPara now matches the current rawParagraphs[i]
+			// This is tricky because Split can produce segments that are just newlines
+			// or that span multiple original lines.
+
+			// A simpler heuristic: assume paraText corresponds to a sequence of lines in gapLines.
+			// Count how many original lines are in paraText (including its internal newlines)
+			// to advance currentLineInfoIdx.
+
+			currentLineInfoIdx++                // Always advance at least one line from gapLines
+			if builtPara.String() == paraText { // If we've reconstructed the exact segment from Split
+				break
 			}
+			// If paraText ends with a newline and builtPara doesn't yet, add another line from gapLines
+			// This logic is complex if paraText itself contains multiple original lines from gapLines.
+			// For now, we'll assume paraText from Split can be reconstructed by joining
+			// some number of consecutive lines from gapLines.
+			// The number of lines is paraLinesCount.
+			if builtPara.Len() >= len(paraText) { // if built string is already as long or longer
+				break
+			}
+			builtPara.WriteString("\n") // add separator for next line from gapLines
+		}
+
+		trimmedPara := strings.TrimSpace(paraText) // Use paraText from Split for trimming
+		if trimmedPara == "" {
+			continue // Skip empty paragraphs
+		}
+
+		if len(currentParaLines) == 0 { // Should not happen if trimmedPara is not empty
 			continue
 		}
 
-		normalized := NormalizeText(trimmedPara)
-		linesInThisTrimmedBlock := strings.Count(trimmedPara, "\n")
+		normalized := NormalizeTextBlock(trimmedPara)
 
-		tempBlock := ContentBlock{
+		block := ContentBlock{
 			ID:             blockIDCounter,
 			OriginalText:   trimmedPara,
 			NormalizedText: normalized,
-			Checksum:       CalculateChecksum(normalized),
+			Checksum:       CalculateBlockChecksum(trimmedPara),
 			Embedding:      StubbedGetEmbedding(normalized),
-			LineStart:      startLineForPara,
-			LineEnd:        startLineForPara + linesInThisTrimmedBlock,
+			LineStart:      currentParaLines[0].OriginalLineNum,
+			LineEnd:        currentParaLines[len(currentParaLines)-1].OriginalLineNum,
 			FileOrigin:     fileOrigin,
+			SourceLineRefs: currentParaLines, // Store the actual LineInfo objects
 		}
-		tempBlocks = append(tempBlocks, tempBlock)
-		blockIDCounter++
-
-		currentLineNumberInOriginalFile += numInternalNewlinesInPara
-		if para != "" {
-			currentLineNumberInOriginalFile++
-		}
-	}
-
-	currentAdjustedLine := 1
-	for i := range tempBlocks {
-		block := tempBlocks[i]
-		block.LineStart = currentAdjustedLine
-		block.LineEnd = currentAdjustedLine + strings.Count(block.OriginalText, "\n")
 		finalBlocks = append(finalBlocks, block)
-		currentAdjustedLine = block.LineEnd + 2
+		blockIDCounter++
 	}
-	return finalBlocks
+	return finalBlocks, blockIDCounter
 }

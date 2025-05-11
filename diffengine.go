@@ -1,12 +1,14 @@
+// diffengine.go
 package main
 
 import (
 	"fmt"
 	"sort"
+	"strings"
+
+	"github.com/sergi/go-diff/diffmatchpatch"
 )
 
-// DiffType, DiffEntry, String() method, findLISIndices remain the same
-// ... (ensure these are present as in the previous full version) ...
 type DiffType int
 
 const (
@@ -17,14 +19,20 @@ const (
 	Unchanged
 )
 
+type LineDiffOp struct {
+	Operation diffmatchpatch.Operation
+	Text      string
+}
 type DiffEntry struct {
 	Type       DiffType
 	BlockA     *ContentBlock
 	BlockB     *ContentBlock
 	Similarity float32
+	LineDiffs  []LineDiffOp
 }
 
-func (dt DiffType) String() string { /* ... */
+// String representation for DiffType (Stable)
+func (dt DiffType) String() string {
 	switch dt {
 	case Added:
 		return "NEW"
@@ -40,195 +48,333 @@ func (dt DiffType) String() string { /* ... */
 		return "UNKNOWN"
 	}
 }
-func findLISIndices(initialMatches []DiffEntry) []int {
-	if len(initialMatches) == 0 {
+
+// findLISIndices finds the Longest Increasing Subsequence of B-block start lines (Stable)
+func findLISIndices(pairedMatches []DiffEntry) []int {
+	if len(pairedMatches) == 0 {
 		return []int{}
 	}
-	bLineStarts := make([]int, len(initialMatches))
-	for i, match := range initialMatches {
+	bLineStarts := make([]int, len(pairedMatches))
+	for i, match := range pairedMatches {
+		if match.BlockB == nil {
+			// This case should ideally not happen if pairedMatches are valid
+			// Or, handle by returning error or filtering out such matches upstream
+			return []int{} // Or some other error indication
+		}
 		bLineStarts[i] = match.BlockB.LineStart
 	}
+
+	// Standard LIS algorithm
 	tails := make([]int, 0, len(bLineStarts))
-	tailOriginalIndices := make([]int, 0, len(bLineStarts))
-	predecessorMatchIndices := make([]int, len(bLineStarts))
+	tailOriginalIndices := make([]int, 0, len(bLineStarts)) // Stores original indices in pairedMatches for LIS construction
+	predecessorMatchIndices := make([]int, len(pairedMatches))
 	for i := range predecessorMatchIndices {
-		predecessorMatchIndices[i] = -1
+		predecessorMatchIndices[i] = -1 // -1 indicates no predecessor
 	}
+
 	for i, bLine := range bLineStarts {
+		// Find insertion point `j` for `bLine` in `tails`
 		j := sort.Search(len(tails), func(k int) bool { return tails[k] >= bLine })
+
 		if j == len(tails) {
+			// `bLine` is greater than all current tails, extend LIS
 			tails = append(tails, bLine)
-			tailOriginalIndices = append(tailOriginalIndices, i)
+			tailOriginalIndices = append(tailOriginalIndices, i) // Store index from pairedMatches
 		} else {
+			// `bLine` replaces an existing tail
 			tails[j] = bLine
-			tailOriginalIndices[j] = i
+			tailOriginalIndices[j] = i // Store index from pairedMatches
 		}
+
+		// Link predecessor for LIS reconstruction
 		if j > 0 {
 			predecessorMatchIndices[i] = tailOriginalIndices[j-1]
 		}
 	}
+
 	if len(tailOriginalIndices) == 0 {
 		return []int{}
 	}
+
+	// Reconstruct LIS from `tailOriginalIndices` and `predecessorMatchIndices`
 	lisResultIndices := make([]int, len(tails))
-	currentIndexInInitialMatches := tailOriginalIndices[len(tails)-1]
+	currentIndexInPairedMatches := tailOriginalIndices[len(tails)-1]
 	for i := len(tails) - 1; i >= 0; i-- {
-		lisResultIndices[i] = currentIndexInInitialMatches
-		currentIndexInInitialMatches = predecessorMatchIndices[currentIndexInInitialMatches]
-		if currentIndexInInitialMatches == -1 && i > 0 {
+		lisResultIndices[i] = currentIndexInPairedMatches
+		currentIndexInPairedMatches = predecessorMatchIndices[currentIndexInPairedMatches]
+		if currentIndexInPairedMatches == -1 && i > 0 {
+			// Should not happen in a correctly formed LIS if len(tails) > 0
 			break
 		}
 	}
 	return lisResultIndices
 }
 
-func PerformDiff(blocksA, blocksB []ContentBlock) []DiffEntry {
-	var allPairedMatches []DiffEntry // Stores all BlockA-BlockB pairs (Unchanged or Modified)
-
-	// --- Stage 0: Preparation ---
-	// Maps for quick lookup by ID
-	mapA_idToBlock := make(map[int]*ContentBlock)
-	for i := range blocksA {
-		mapA_idToBlock[blocksA[i].ID] = &blocksA[i]
-	}
-	mapB_idToBlock := make(map[int]*ContentBlock)
-	for i := range blocksB {
-		mapB_idToBlock[blocksB[i].ID] = &blocksB[i]
-	}
-
-	// Keep track of processed blocks to avoid re-matching
-	processedA_byID := make(map[int]bool) // Tracks A blocks already paired (exact or semantic)
-	processedB_byID := make(map[int]bool) // Tracks B blocks already paired
-
-	// --- Stage 1: Global Exact Matches (Checksum based) ---
-	// Build a checksum map for File B's blocks for efficient lookup
-	mapB_checksumToAvailableBlockPointers := make(map[string][]*ContentBlock)
-	for i := range blocksB {
-		blockB_ptr := &blocksB[i]
-		mapB_checksumToAvailableBlockPointers[blockB_ptr.Checksum] = append(mapB_checksumToAvailableBlockPointers[blockB_ptr.Checksum], blockB_ptr)
-	}
-
-	for i := range blocksA { // Iterate through File A blocks
-		blockA_ptr := &blocksA[i]
-		if potentialMatchingBs, ok := mapB_checksumToAvailableBlockPointers[blockA_ptr.Checksum]; ok {
-			// Find the first available B block with this checksum
-			foundB_idx := -1
-			var blockB_match_ptr *ContentBlock
-			for b_idx, b_ptr := range potentialMatchingBs {
-				if !processedB_byID[b_ptr.ID] {
-					blockB_match_ptr = b_ptr
-					foundB_idx = b_idx
-					break
-				}
-			}
-
-			if blockB_match_ptr != nil {
-				allPairedMatches = append(allPairedMatches, DiffEntry{Type: Unchanged, BlockA: blockA_ptr, BlockB: blockB_match_ptr})
-				processedA_byID[blockA_ptr.ID] = true
-				processedB_byID[blockB_match_ptr.ID] = true
-
-				// Optional: To prevent reusing the exact same B block instance if multiple A blocks match it,
-				// one could remove it from `potentialMatchingBs` or mark it used in a more granular way.
-				// For simplicity, `processedB_byID` handles this broadly. If checksum collisions are rare for distinct blocks, this is fine.
-				// If checksums are identical for truly distinct blocks (very rare for SHA256), this might "claim" a B block prematurely.
-				// A slightly more robust way if checksums could collide for different blocks:
-				if foundB_idx != -1 && len(potentialMatchingBs) > 1 {
-					// This logic is tricky to get right without overcomplicating.
-					// The current processedB_byID should suffice for most cases.
-				}
-			}
+// getLinesWithInfo processes raw content into LineInfo objects (Stable)
+func getLinesWithInfo(content string, fileOrigin string) []LineInfo {
+	rawLines := strings.Split(strings.ReplaceAll(content, "\r\n", "\n"), "\n")
+	lineInfos := make([]LineInfo, len(rawLines))
+	for i, lineText := range rawLines {
+		lineInfos[i] = LineInfo{
+			OriginalText:    lineText,
+			TrimmedText:     strings.TrimSpace(lineText),
+			Checksum:        CalculateLineChecksum(lineText), // Assuming CalculateLineChecksum exists
+			OriginalLineNum: i + 1,
+			FileOrigin:      fileOrigin,
+			IsPartOfMega:    false,
 		}
 	}
-	if DebugMode {
-		fmt.Printf("Global Exact Matches found: %d\n", len(allPairedMatches))
-	}
+	return lineInfos
+}
 
-	// --- Stage 2: Semantic Matches (for remaining blocks) ---
-	var remainingA_ptrs []*ContentBlock
-	for i := range blocksA {
-		if !processedA_byID[blocksA[i].ID] {
-			remainingA_ptrs = append(remainingA_ptrs, &blocksA[i])
+const MinMegaBlockLength = 3
+const MinParagraphLinesForSemanticMatch = 3 // Minimum lines for a gap paragraph to be considered for semantic matching
+
+// findNextGreedyMegaMatch finds the next longest contiguous block of identical lines.
+// Removed an empty 'if DebugMode {}' block.
+func findNextGreedyMegaMatch(linesA, linesB []LineInfo) (aStart, bStart, length int, found bool) {
+	bestLen := 0
+	foundAStart, foundBStart := -1, -1
+
+	for i := 0; i < len(linesA); i++ {
+		if linesA[i].IsPartOfMega {
+			continue
 		}
-	}
-	// Sort remainingA_ptrs to process consistently (though greedy matching can change order of pairing)
-	sort.Slice(remainingA_ptrs, func(i, j int) bool { return remainingA_ptrs[i].ID < remainingA_ptrs[j].ID })
-
-	// Collect remaining B blocks once
-	var remainingB_ptrs []*ContentBlock
-	for i := range blocksB {
-		if !processedB_byID[blocksB[i].ID] {
-			remainingB_ptrs = append(remainingB_ptrs, &blocksB[i])
-		}
-	}
-
-	for _, blockA_ptr := range remainingA_ptrs {
-		bestMatchB_ptr_for_A := (*ContentBlock)(nil)
-		highestSimilarity_for_A := float32(-1.0)
-
-		if DebugMode {
-			fmt.Printf("\n--- Semantically Checking A Block ID %d (L%d): \"%.60s...\"\n", blockA_ptr.ID, blockA_ptr.LineStart, blockA_ptr.NormalizedText)
-		}
-
-		for _, currentB_ptr := range remainingB_ptrs { // Iterate only through remaining B blocks
-			if processedB_byID[currentB_ptr.ID] { // Double check, though remainingB_ptrs should only have available ones
+		for j := 0; j < len(linesB); j++ {
+			if linesB[j].IsPartOfMega {
 				continue
 			}
-			similarity := TextSimilarityNormalized(blockA_ptr.NormalizedText, currentB_ptr.NormalizedText)
-			if DebugMode {
-				fmt.Printf("  Comparing with B Block ID %d (L%d): \"%.60s...\" -> Similarity: %.4f (Threshold: %.2f)\n",
-					currentB_ptr.ID, currentB_ptr.LineStart, currentB_ptr.NormalizedText, similarity, float32(SimilarityThreshold))
-			}
-			if similarity > highestSimilarity_for_A {
-				highestSimilarity_for_A = similarity
-				bestMatchB_ptr_for_A = currentB_ptr
+			if linesA[i].Checksum == linesB[j].Checksum {
+				// Potential start of a match
+				currentLen := 0
+				for k := 0; i+k < len(linesA) && j+k < len(linesB); k++ {
+					if linesA[i+k].IsPartOfMega || linesB[j+k].IsPartOfMega {
+						break // One of the lines is already part of a megablock
+					}
+					if linesA[i+k].Checksum == linesB[j+k].Checksum {
+						currentLen++
+					} else {
+						break // Mismatch
+					}
+				}
+				if currentLen > bestLen {
+					bestLen = currentLen
+					foundAStart = i
+					foundBStart = j
+				}
 			}
 		}
+	}
 
-		if bestMatchB_ptr_for_A != nil && highestSimilarity_for_A >= float32(SimilarityThreshold) {
-			if DebugMode {
-				fmt.Printf("  SEMANTIC MATCHED A ID %d with B ID %d (Similarity: %.4f)\n", blockA_ptr.ID, bestMatchB_ptr_for_A.ID, highestSimilarity_for_A)
-			}
-			allPairedMatches = append(allPairedMatches, DiffEntry{
-				Type:       Modified, // Tentative type
-				BlockA:     blockA_ptr,
-				BlockB:     bestMatchB_ptr_for_A,
-				Similarity: highestSimilarity_for_A,
-			})
-			processedA_byID[blockA_ptr.ID] = true
-			processedB_byID[bestMatchB_ptr_for_A.ID] = true // This B block is now claimed
-		} else if DebugMode {
-			bestBBlockID := -1
-			if bestMatchB_ptr_for_A != nil {
-				bestBBlockID = bestMatchB_ptr_for_A.ID
-			}
-			fmt.Printf("  NO SEMANTIC MATCH for A ID %d (Highest sim: %.4f with B ID %d, Threshold: %.2f)\n", blockA_ptr.ID, highestSimilarity_for_A, bestBBlockID, float32(SimilarityThreshold))
+	if bestLen >= MinMegaBlockLength {
+		return foundAStart, foundBStart, bestLen, true
+	}
+	return -1, -1, 0, false
+}
+
+// PerformDiff is the main diffing logic.
+// Removed several empty 'if DebugMode {}' blocks for clarity.
+// The 'NO SEMANTIC MATCH' debug prints remain correctly guarded by 'else if DebugMode'.
+func PerformDiff(rawContentA string, rawContentB string) []DiffEntry {
+	// Stage 1: Preprocessing - Get LineInfo for both files
+	allLinesA := getLinesWithInfo(rawContentA, "A")
+	allLinesB := getLinesWithInfo(rawContentB, "B")
+
+	var megablockDiffs []DiffEntry
+	blockGlobalIDCounter := 0 // Used to assign unique IDs to blocks as they are created
+
+	// Stage 2: Greedy Megablock Matching
+	for {
+		aStart, bStart, length, found := findNextGreedyMegaMatch(allLinesA, allLinesB)
+		if !found {
+			break
+		}
+
+		// Create ContentBlocks for the megamatch
+		var textAblockLines []string
+		for k := 0; k < length; k++ {
+			textAblockLines = append(textAblockLines, allLinesA[aStart+k].OriginalText)
+		}
+		blockAText := strings.Join(textAblockLines, "\n")
+		cbA := ContentBlock{
+			ID:             blockGlobalIDCounter,
+			OriginalText:   blockAText,
+			NormalizedText: NormalizeTextBlock(blockAText),
+			Checksum:       CalculateBlockChecksum(blockAText),
+			Embedding:      StubbedGetEmbedding(NormalizeTextBlock(blockAText)),
+			LineStart:      allLinesA[aStart].OriginalLineNum,
+			LineEnd:        allLinesA[aStart+length-1].OriginalLineNum,
+			FileOrigin:     "A",
+			SourceLineRefs: allLinesA[aStart : aStart+length], // Store involved lines
+		}
+		blockGlobalIDCounter++
+
+		var textBblockLines []string
+		for k := 0; k < length; k++ {
+			textBblockLines = append(textBblockLines, allLinesB[bStart+k].OriginalText)
+		}
+		blockBText := strings.Join(textBblockLines, "\n")
+		cbB := ContentBlock{
+			ID:             blockGlobalIDCounter,
+			OriginalText:   blockBText,
+			NormalizedText: NormalizeTextBlock(blockBText),
+			Checksum:       CalculateBlockChecksum(blockBText),
+			Embedding:      StubbedGetEmbedding(NormalizeTextBlock(blockBText)),
+			LineStart:      allLinesB[bStart].OriginalLineNum,
+			LineEnd:        allLinesB[bStart+length-1].OriginalLineNum,
+			FileOrigin:     "B",
+			SourceLineRefs: allLinesB[bStart : bStart+length], // Store involved lines
+		}
+		blockGlobalIDCounter++
+
+		megablockDiffs = append(megablockDiffs, DiffEntry{Type: Unchanged, BlockA: &cbA, BlockB: &cbB})
+
+		// Mark lines as consumed by megablocks
+		for k := 0; k < length; k++ {
+			allLinesA[aStart+k].IsPartOfMega = true
+			allLinesB[bStart+k].IsPartOfMega = true
 		}
 	}
 	if DebugMode {
-		fmt.Printf("Total Paired Matches (Exact + Semantic): %d\n", len(allPairedMatches))
+		fmt.Printf("Megablocks found: %d\n", len(megablockDiffs))
 	}
 
-	// --- Stage 3: Identify MOVED blocks from allPairedMatches ---
-	var finalDiffs []DiffEntry
+	// Stage 3: Segment Gaps into Paragraphs
+	var gapBlocksA, gapBlocksB []ContentBlock
+	currentGapA := []LineInfo{}
+	for i := 0; i < len(allLinesA); i++ {
+		if !allLinesA[i].IsPartOfMega {
+			currentGapA = append(currentGapA, allLinesA[i])
+		} else {
+			if len(currentGapA) > 0 {
+				var segmented []ContentBlock
+				segmented, blockGlobalIDCounter = SegmentGapText(currentGapA, "A", blockGlobalIDCounter)
+				gapBlocksA = append(gapBlocksA, segmented...)
+				currentGapA = []LineInfo{}
+			}
+		}
+	}
+	if len(currentGapA) > 0 { // Process any trailing gap
+		var segmented []ContentBlock
+		segmented, blockGlobalIDCounter = SegmentGapText(currentGapA, "A", blockGlobalIDCounter)
+		gapBlocksA = append(gapBlocksA, segmented...)
+	}
 
-	sort.Slice(allPairedMatches, func(i, j int) bool { // Sort by File A's block order
+	currentGapB := []LineInfo{}
+	for i := 0; i < len(allLinesB); i++ {
+		if !allLinesB[i].IsPartOfMega {
+			currentGapB = append(currentGapB, allLinesB[i])
+		} else {
+			if len(currentGapB) > 0 {
+				var segmented []ContentBlock
+				segmented, blockGlobalIDCounter = SegmentGapText(currentGapB, "B", blockGlobalIDCounter)
+				gapBlocksB = append(gapBlocksB, segmented...)
+				currentGapB = []LineInfo{}
+			}
+		}
+	}
+	if len(currentGapB) > 0 { // Process any trailing gap
+		var segmented []ContentBlock
+		segmented, blockGlobalIDCounter = SegmentGapText(currentGapB, "B", blockGlobalIDCounter)
+		gapBlocksB = append(gapBlocksB, segmented...)
+	}
+
+	if DebugMode {
+		fmt.Printf("Gap blocks in A: %d, Gap blocks in B: %d\n", len(gapBlocksA), len(gapBlocksB))
+	}
+
+	// Stage 4: Semantic Matching of Gap Paragraphs
+	var semanticGapMatches []DiffEntry
+	processedGapA_byID := make(map[int]bool) // Tracks Gap A blocks already matched
+	processedGapB_byID := make(map[int]bool) // Tracks Gap B blocks already matched
+	dmp := diffmatchpatch.New()
+
+	// Sort gapBlocksA by ID to ensure deterministic processing if needed, though order of finding best match doesn't strictly require it.
+	sort.Slice(gapBlocksA, func(i, j int) bool { return gapBlocksA[i].ID < gapBlocksA[j].ID })
+
+	for i := range gapBlocksA {
+		gapA_ptr := &gapBlocksA[i]
+		// Skip very short paragraphs for semantic matching to reduce noise (already part of logic)
+		numLinesInGapA := strings.Count(gapA_ptr.OriginalText, "\n") + 1
+		if numLinesInGapA < MinParagraphLinesForSemanticMatch {
+			continue
+		}
+
+		bestMatchGapB_ptr := (*ContentBlock)(nil)
+		highestSimilarity := float32(-1.0)
+
+		for j := range gapBlocksB {
+			gapB_ptr := &gapBlocksB[j]
+			if processedGapB_byID[gapB_ptr.ID] { // Already matched this B block
+				continue
+			}
+			numLinesInGapB := strings.Count(gapB_ptr.OriginalText, "\n") + 1
+			if numLinesInGapB < MinParagraphLinesForSemanticMatch {
+				continue // Skip very short B paragraphs
+			}
+
+			similarity := TextSimilarityNormalized(gapA_ptr.NormalizedText, gapB_ptr.NormalizedText)
+			if similarity > highestSimilarity {
+				highestSimilarity = similarity
+				bestMatchGapB_ptr = gapB_ptr
+			}
+		}
+
+		if bestMatchGapB_ptr != nil && highestSimilarity >= float32(SimilarityThreshold) {
+			entry := DiffEntry{Type: Modified, BlockA: gapA_ptr, BlockB: bestMatchGapB_ptr, Similarity: highestSimilarity}
+			// Perform line-level diff for MODIFIED blocks
+			diffsFromDMP := dmp.DiffMain(gapA_ptr.OriginalText, bestMatchGapB_ptr.OriginalText, true) // true for line mode
+			dmp.DiffCleanupSemantic(diffsFromDMP)                                                     // Optional: clean up semantic noise
+			var lineDiffs []LineDiffOp
+			for _, d := range diffsFromDMP {
+				lineDiffs = append(lineDiffs, LineDiffOp{Operation: d.Type, Text: d.Text})
+			}
+			entry.LineDiffs = lineDiffs
+			semanticGapMatches = append(semanticGapMatches, entry)
+			processedGapA_byID[gapA_ptr.ID] = true
+			processedGapB_byID[bestMatchGapB_ptr.ID] = true
+		} else if DebugMode {
+			// This is the specific debug message block from user's output.
+			// It is correctly guarded by 'DebugMode'.
+			// If these messages appear without --debug, it implies the running code
+			// differs from this version in this specific 'else if' condition.
+			if bestMatchGapB_ptr != nil {
+				fmt.Printf("  NO SEMANTIC MATCH for Gap A ID %d (Highest sim: %.4f with B ID %d, Thresh: %.2f)\n", gapA_ptr.ID, highestSimilarity, bestMatchGapB_ptr.ID, float32(SimilarityThreshold))
+			} else {
+				fmt.Printf("  NO SEMANTIC MATCH for Gap A ID %d (Highest sim: %.4f, No B candidate found, Thresh: %.2f)\n", gapA_ptr.ID, highestSimilarity, float32(SimilarityThreshold))
+			}
+		}
+	}
+	if DebugMode {
+		fmt.Printf("Semantic matches between gap blocks: %d\n", len(semanticGapMatches))
+	}
+
+	// Stage 5: LIS for Positional Analysis (Moved vs. Unchanged/Modified-in-place)
+	allPairedMatches := append([]DiffEntry{}, megablockDiffs...)
+	allPairedMatches = append(allPairedMatches, semanticGapMatches...)
+
+	// Sort allPairedMatches by BlockA's start line to prepare for LIS
+	sort.Slice(allPairedMatches, func(i, j int) bool {
 		if allPairedMatches[i].BlockA.LineStart != allPairedMatches[j].BlockA.LineStart {
 			return allPairedMatches[i].BlockA.LineStart < allPairedMatches[j].BlockA.LineStart
 		}
-		return allPairedMatches[i].BlockA.ID < allPairedMatches[j].BlockA.ID
+		return allPairedMatches[i].BlockA.ID < allPairedMatches[j].BlockA.ID // Tie-break by ID for stability
 	})
 
+	var finalDiffs []DiffEntry
 	if len(allPairedMatches) > 0 {
-		lisIndicesInPairedMatches := findLISIndices(allPairedMatches)
-		isLisMember := make(map[int]bool)
-		for _, originalIdx := range lisIndicesInPairedMatches {
-			isLisMember[originalIdx] = true
+		lisIndices := findLISIndices(allPairedMatches) // Get indices of matches that form LIS based on BlockB start lines
+		isLisMember := make(map[int]bool)              // To quickly check if a match (by its index in allPairedMatches) is part of LIS
+		for _, idx := range lisIndices {
+			isLisMember[idx] = true
 		}
 
 		for i, matchEntry := range allPairedMatches {
-			if isLisMember[i] { // Part of LIS: Type is Unchanged or Modified
+			if isLisMember[i] {
+				// Type remains Unchanged (for megablocks) or Modified (for semantic matches)
 				finalDiffs = append(finalDiffs, matchEntry)
-			} else { // Not part of LIS: Type is Moved
+			} else {
+				// Not in LIS, so it's MOVED
 				movedEntry := matchEntry
 				movedEntry.Type = Moved
 				finalDiffs = append(finalDiffs, movedEntry)
@@ -236,41 +382,44 @@ func PerformDiff(blocksA, blocksB []ContentBlock) []DiffEntry {
 		}
 	}
 
-	// --- Stage 4: Add truly Added/Deleted blocks ---
-	for i := range blocksA {
-		if !processedA_byID[blocksA[i].ID] {
-			finalDiffs = append(finalDiffs, DiffEntry{Type: Deleted, BlockA: &blocksA[i]})
+	// Stage 6: Identify Added/Deleted Gap Paragraphs
+	for i := range gapBlocksA {
+		if !processedGapA_byID[gapBlocksA[i].ID] { // If not part of megablock and not semantically matched
+			finalDiffs = append(finalDiffs, DiffEntry{Type: Deleted, BlockA: &gapBlocksA[i]})
 		}
 	}
-	for i := range blocksB {
-		if !processedB_byID[blocksB[i].ID] {
-			finalDiffs = append(finalDiffs, DiffEntry{Type: Added, BlockB: &blocksB[i]})
+	for i := range gapBlocksB {
+		if !processedGapB_byID[gapBlocksB[i].ID] { // If not part of megablock and not semantically matched
+			finalDiffs = append(finalDiffs, DiffEntry{Type: Added, BlockB: &gapBlocksB[i]})
 		}
 	}
 
-	// --- Stage 5: Sort finalDiffs for output ---
-	// ... (Sorting logic remains the same) ...
+	// Stage 7: Sort finalDiffs for consistent output
 	sort.Slice(finalDiffs, func(i, j int) bool {
+		// Primary sort by DiffType
 		if finalDiffs[i].Type != finalDiffs[j].Type {
 			return finalDiffs[i].Type < finalDiffs[j].Type
 		}
+		// Secondary sort: by File A line (if available), then File B line
 		if finalDiffs[i].BlockA != nil && finalDiffs[j].BlockA != nil {
 			if finalDiffs[i].BlockA.LineStart != finalDiffs[j].BlockA.LineStart {
 				return finalDiffs[i].BlockA.LineStart < finalDiffs[j].BlockA.LineStart
 			}
-			return finalDiffs[i].BlockA.ID < finalDiffs[j].BlockA.ID
-		} else if finalDiffs[i].BlockA != nil {
+			return finalDiffs[i].BlockA.ID < finalDiffs[j].BlockA.ID // Fallback to ID
+		} else if finalDiffs[i].BlockA != nil { // A entries first
 			return true
 		} else if finalDiffs[j].BlockA != nil {
 			return false
 		}
+		// For Added blocks (only BlockB exists)
 		if finalDiffs[i].BlockB != nil && finalDiffs[j].BlockB != nil {
 			if finalDiffs[i].BlockB.LineStart != finalDiffs[j].BlockB.LineStart {
 				return finalDiffs[i].BlockB.LineStart < finalDiffs[j].BlockB.LineStart
 			}
-			return finalDiffs[i].BlockB.ID < finalDiffs[j].BlockB.ID
+			return finalDiffs[i].BlockB.ID < finalDiffs[j].BlockB.ID // Fallback to ID
 		}
-		return false
+		return false // Should not happen if blocks are well-formed
 	})
+
 	return finalDiffs
 }
